@@ -15,34 +15,81 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 
-class LayerNorm(nn.Module):
-    """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
+# try to import flash_attn
+try:
+    from flash_attn import flash_attn_func
+except ImportError:
+    flash_attn_func = None
 
-    def __init__(self, ndim, bias):
+
+class RMSNorm(nn.Module):
+    """RMSNorm replacing LayerNorm"""
+
+    def __init__(self, dim: int, eps: float = 1e-5):
         super().__init__()
-        self.weight = nn.Parameter(torch.ones(ndim))
-        self.bias = nn.Parameter(torch.zeros(ndim)) if bias else None
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(dim))
 
-    def forward(self, input):
-        return F.layer_norm(input, self.weight.shape, self.weight, self.bias, 1e-5)
+    def _norm(self, x):
+        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
+
+    def forward(self, x):
+        output = self._norm(x.float()).type_as(x)
+        return output * self.weight
+
+
+class RotaryEmbedding(nn.Module):
+    """
+    Rotary Position Embedding (RoPE) module.
+    """
+    def __init__(self, dim, max_seq_len=2048):
+        super().__init__()
+        inv_freq = 1.0 / (10000 ** (torch.arange(0, dim, 2).float() / dim))
+        self.register_buffer("inv_freq", inv_freq)
+        self.max_seq_len = max_seq_len
+        self.cache = None
+
+    def forward(self, x):
+        seq_len = x.shape[1]
+        if self.cache is None or self.cache.shape[0] < seq_len:
+            t = torch.arange(seq_len, device=x.device).type_as(self.inv_freq)
+            freqs = torch.einsum("i,j->ij", t, self.inv_freq)
+            emb = torch.cat((freqs, freqs), dim=-1).to(x.device)
+            self.cache = emb[None, None, :, :]
+        return self.cache[:, :, :seq_len, :]
+
+def rotate_half(x):
+    x1, x2 = x[..., : x.shape[-1] // 2], x[..., x.shape[-1] // 2 :]
+    return torch.cat((-x2, x1), dim=-1)
+
+def apply_rotary_pos_emb(q, k, freqs):
+    q_embed = (q * freqs.cos()) + (rotate_half(q) * freqs.sin())
+    k_embed = (k * freqs.cos()) + (rotate_half(k) * freqs.sin())
+    return q_embed.type_as(q), k_embed.type_as(k)
+
 
 class CausalSelfAttention(nn.Module):
+    """
+    Causal Self-Attention with Grouped-Query Attention (GQA) and Flash Attention.
+    """
 
     def __init__(self, config):
         super().__init__()
         assert config.n_embd % config.n_head == 0
         # key, query, value projections for all heads, but in a batch
-        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
+        self.c_attn = nn.Linear(config.n_embd, config.n_embd + 2 * config.n_kv_heads * (config.n_embd // config.n_head), bias=config.bias)
         # output projection
         self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
         # regularization
         self.attn_dropout = nn.Dropout(config.dropout)
         self.resid_dropout = nn.Dropout(config.dropout)
         self.n_head = config.n_head
+        self.n_kv_heads = config.n_kv_heads
         self.n_embd = config.n_embd
         self.dropout = config.dropout
+        self.rotary_emb = RotaryEmbedding(config.n_embd // config.n_head)
         # flash attention make GPU go brrrrr but support is only in PyTorch >= 2.0
-        self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
+        self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention') and flash_attn_func is not None
         if not self.flash:
             print("WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0")
             # causal mask to ensure that attention is only applied to the left in the input sequence
@@ -53,22 +100,29 @@ class CausalSelfAttention(nn.Module):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
 
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
-        q, k, v  = self.c_attn(x).split(self.n_embd, dim=2)
-        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+        q, k, v  = self.c_attn(x).split([self.n_embd, self.n_kv_heads * (C // self.n_head), self.n_kv_heads * (C // self.n_head)], dim=2)
+        k = k.view(B, T, self.n_kv_heads, C // self.n_head).transpose(1, 2) # (B, n_kv_heads, T, hs)
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+        v = v.view(B, T, self.n_kv_heads, C // self.n_head).transpose(1, 2) # (B, n_kv_heads, T, hs)
+
+        # Apply RoPE
+        freqs = self.rotary_emb(q)
+        q, k = apply_rotary_pos_emb(q, k, freqs)
+
+        # Grouped-Query Attention: repeat k/v heads if n_kv_heads < n_head
+        if self.n_kv_heads != self.n_head:
+            n_repeats = self.n_head // self.n_kv_heads
+            k = k.unsqueeze(2).repeat(1, 1, n_repeats, 1, 1).view(B, self.n_head, T, C // self.n_head)
+            v = v.unsqueeze(2).repeat(1, 1, n_repeats, 1, 1).view(B, self.n_head, T, C // self.n_head)
 
         # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
         if self.flash:
             # efficient attention using Flash Attention CUDA kernels
-            y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)
+            y = flash_attn_func(q.transpose(1,2), k.transpose(1,2), v.transpose(1,2), dropout_p=self.dropout if self.training else 0, causal=True)
+            y = y.transpose(1,2)
         else:
             # manual implementation of attention
-            att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-            att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
-            att = F.softmax(att, dim=-1)
-            att = self.attn_dropout(att)
-            y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+            y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)
         y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
 
         # output projection
@@ -95,9 +149,9 @@ class Block(nn.Module):
 
     def __init__(self, config):
         super().__init__()
-        self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
+        self.ln_1 = RMSNorm(config.n_embd)
         self.attn = CausalSelfAttention(config)
-        self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
+        self.ln_2 = RMSNorm(config.n_embd)
         self.mlp = MLP(config)
 
     def forward(self, x):
@@ -111,6 +165,7 @@ class GPTConfig:
     vocab_size: int = 50304 # GPT-2 vocab_size of 50257, padded up to nearest multiple of 64 for efficiency
     n_layer: int = 12
     n_head: int = 12
+    n_kv_heads: int = 12
     n_embd: int = 768
     dropout: float = 0.0
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
@@ -125,10 +180,9 @@ class GPT(nn.Module):
 
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd),
-            wpe = nn.Embedding(config.block_size, config.n_embd),
             drop = nn.Dropout(config.dropout),
             h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
-            ln_f = LayerNorm(config.n_embd, bias=config.bias),
+            ln_f = RMSNorm(config.n_embd),
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         # with weight tying when using torch.compile() some warnings get generated:
@@ -155,8 +209,6 @@ class GPT(nn.Module):
         params are actually used as weights in the final layer, so we include them.
         """
         n_params = sum(p.numel() for p in self.parameters())
-        if non_embedding:
-            n_params -= self.transformer.wpe.weight.numel()
         return n_params
 
     def _init_weights(self, module):
@@ -171,12 +223,10 @@ class GPT(nn.Module):
         device = idx.device
         b, t = idx.size()
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
-        pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t)
 
         # forward the GPT model itself
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
-        pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
-        x = self.transformer.drop(tok_emb + pos_emb)
+        x = self.transformer.drop(tok_emb)
         for block in self.transformer.h:
             x = block(x)
         x = self.transformer.ln_f(x)
@@ -198,8 +248,8 @@ class GPT(nn.Module):
         # but want to use a smaller block size for some smaller, simpler model
         assert block_size <= self.config.block_size
         self.config.block_size = block_size
-        self.transformer.wpe.weight = nn.Parameter(self.transformer.wpe.weight[:block_size])
         for block in self.transformer.h:
+            block.attn.rotary_emb.max_seq_len = block_size
             if hasattr(block.attn, 'bias'):
                 block.attn.bias = block.attn.bias[:,:,:block_size,:block_size]
 
